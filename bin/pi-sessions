@@ -1,0 +1,1186 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 webdawg / contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""pi-sessions — list, snapshot, pick, and restore Pi coding-agent sessions with cwd.
+
+Primary UX
+----------
+  pi-sessions              # arrow-key table of non-running sessions (cwd-scoped)
+  pi-sessions pick         # same
+  pi-sessions pick --all-cwd
+
+Table columns: name, last user message, cwd, mtime, id.
+Keys: ↑↓ move · Enter resume here · o open new terminal (stay) · / filter · q quit
+
+Also: live | snapshot | resume | restore | list
+"""
+
+from __future__ import annotations
+
+import argparse
+import curses
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import time
+from collections import defaultdict
+from datetime import datetime, timezone
+from typing import Any
+
+HOME = pathlib.Path.home()
+SESSIONS_ROOT = HOME / ".pi" / "agent" / "sessions"
+LIVE_DIR = HOME / ".pi" / "agent" / "live-sessions"
+DEFAULT_SNAPSHOT_DIR = HOME / ".local" / "share" / "pi-sessions"
+PI_BIN = shutil.which("pi") or "pi"
+TAIL_SCAN_BYTES = 2_000_000
+
+
+def iso_now() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def human_time(ts: float | str | None) -> str:
+    if ts is None:
+        return "-"
+    if isinstance(ts, str):
+        return ts.replace("T", " ")[:19]
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def short_path(path: str | None) -> str:
+    if not path:
+        return "-"
+    p = str(path)
+    home = str(HOME)
+    if p.startswith(home):
+        return "~" + p[len(home) :]
+    return p
+
+
+def shlex_quote(s: str) -> str:
+    return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
+def read_json(path: pathlib.Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_json(path: pathlib.Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def one_line(text: str | None, width: int) -> str:
+    if not text:
+        return "-"
+    s = " ".join(text.split())
+    if width <= 1:
+        return s[:1]
+    if len(s) <= width:
+        return s
+    if width <= 3:
+        return s[:width]
+    return s[: width - 1] + "…"
+
+
+def content_to_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                if block.get("type") == "text":
+                    parts.append(str(block.get("text") or ""))
+                elif "text" in block:
+                    parts.append(str(block.get("text") or ""))
+        return "\n".join(parts)
+    return str(content)
+
+
+def enrich_session(path: pathlib.Path) -> dict[str, Any] | None:
+    """Header + latest name + last user message (tail-scanned)."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            header = json.loads(fh.readline())
+    except Exception:
+        return None
+    if header.get("type") != "session":
+        return None
+
+    name = header.get("name")
+    last_user = ""
+    last_user_ts = None
+    try:
+        size = st.st_size
+        with path.open("rb") as fh:
+            if size > TAIL_SCAN_BYTES:
+                fh.seek(size - TAIL_SCAN_BYTES)
+                fh.readline()
+            data = fh.read().decode("utf-8", "replace")
+        for line in data.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            t = obj.get("type")
+            if t == "session_info" and obj.get("name"):
+                name = obj.get("name")
+            if t != "message":
+                continue
+            msg = obj.get("message") or {}
+            if msg.get("role") != "user":
+                continue
+            text = content_to_text(msg.get("content")).strip()
+            if not text:
+                continue
+            # Skip pure control blobs if any
+            last_user = text
+            last_user_ts = obj.get("timestamp") or msg.get("timestamp")
+    except Exception:
+        pass
+
+    return {
+        "id": header.get("id"),
+        "cwd": header.get("cwd"),
+        "name": name,
+        "path": str(path),
+        "mtime": st.st_mtime,
+        "size": st.st_size,
+        "created": header.get("timestamp"),
+        "lastUser": last_user,
+        "lastUserAt": last_user_ts,
+    }
+
+
+def list_disk_sessions(enriched: bool = True) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not SESSIONS_ROOT.exists():
+        return rows
+    for f in SESSIONS_ROOT.rglob("*.jsonl"):
+        if enriched:
+            row = enrich_session(f)
+            if row:
+                rows.append(row)
+        else:
+            try:
+                with f.open(encoding="utf-8") as fh:
+                    h = json.loads(fh.readline())
+                if h.get("type") != "session":
+                    continue
+                st = f.stat()
+                rows.append(
+                    {
+                        "id": h.get("id"),
+                        "cwd": h.get("cwd"),
+                        "name": h.get("name"),
+                        "path": str(f),
+                        "mtime": st.st_mtime,
+                        "size": st.st_size,
+                        "lastUser": "",
+                    }
+                )
+            except Exception:
+                continue
+    rows.sort(key=lambda r: r["mtime"], reverse=True)
+    return rows
+
+
+def pid_alive(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def list_live_registry() -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not LIVE_DIR.exists():
+        return rows
+    for f in LIVE_DIR.glob("*.json"):
+        if f.name == "index.json":
+            continue
+        try:
+            rec = read_json(f)
+        except Exception:
+            continue
+        rec = dict(rec)
+        rec["_record"] = str(f)
+        rec["alive"] = pid_alive(rec.get("pid")) and rec.get("status") != "shutdown"
+        rows.append(rec)
+    rows.sort(key=lambda r: r.get("updatedAt") or "", reverse=True)
+    return rows
+
+
+def read_proc_environ(pid: int) -> dict[str, str]:
+    env: dict[str, str] = {}
+    try:
+        raw = pathlib.Path(f"/proc/{pid}/environ").read_bytes()
+    except Exception:
+        return env
+    for item in raw.split(b"\0"):
+        if not item or b"=" not in item:
+            continue
+        k, v = item.split(b"=", 1)
+        env[k.decode("utf-8", "replace")] = v.decode("utf-8", "replace")
+    return env
+
+
+def list_pi_processes() -> list[dict[str, Any]]:
+    out = subprocess.check_output(["ps", "-eo", "pid=,comm=,args="], text=True)
+    rows = []
+    for line in out.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 2:
+            continue
+        pid = int(parts[0])
+        comm = parts[1]
+        if comm != "pi":
+            continue
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except Exception:
+            cwd = None
+        env = read_proc_environ(pid)
+        try:
+            ctime = pathlib.Path(f"/proc/{pid}").stat().st_ctime
+        except Exception:
+            ctime = None
+        rows.append(
+            {
+                "pid": pid,
+                "cwd": cwd,
+                "windowId": env.get("WINDOWID"),
+                "sessionFileFromEnv": env.get("PI_SESSION_FILE"),
+                "sessionIdFromEnv": env.get("PI_SESSION_ID"),
+                "started": ctime,
+            }
+        )
+    return rows
+
+
+def list_terminal_titles() -> list[dict[str, Any]]:
+    if not shutil.which("wmctrl"):
+        return []
+    rows = []
+    try:
+        out = subprocess.check_output(["wmctrl", "-lp"], text=True)
+    except Exception:
+        return []
+    for line in out.splitlines():
+        parts = line.split(None, 4)
+        if len(parts) < 5:
+            continue
+        wid_s, _desk, _pid, _host, title = parts
+        if "Terminal" not in title:
+            continue
+        if not any(x in title for x in ("π", "✳", "pi", "Pi")):
+            continue
+        try:
+            wid = int(wid_s, 16)
+        except Exception:
+            continue
+        rows.append({"windowId": str(wid), "windowIdHex": wid_s, "title": title})
+    return rows
+
+
+def running_session_ids() -> set[str]:
+    """Best-effort set of session ids currently attached to a live pi process."""
+    ids: set[str] = set()
+    files: set[str] = set()
+
+    for r in list_live_registry():
+        if r.get("alive") and r.get("sessionId"):
+            ids.add(r["sessionId"])
+        if r.get("alive") and r.get("sessionFile"):
+            files.add(os.path.realpath(r["sessionFile"]))
+
+    # child tool env
+    try:
+        out = subprocess.check_output(["ps", "-eo", "pid="], text=True)
+    except Exception:
+        out = ""
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            pid = int(line)
+        except ValueError:
+            continue
+        env = read_proc_environ(pid)
+        sid = env.get("PI_SESSION_ID")
+        sf = env.get("PI_SESSION_FILE")
+        if sid:
+            ids.add(sid)
+        if sf:
+            try:
+                files.add(os.path.realpath(sf))
+            except Exception:
+                files.add(sf)
+
+    # Heuristic: if exactly one disk session for a live pi cwd and we have no id, mark most recent
+    # (only for running detection of unique-cwd sessions)
+    disk = list_disk_sessions(enriched=False)
+    by_cwd: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    by_path = {}
+    for d in disk:
+        if d.get("cwd"):
+            by_cwd[d["cwd"]].append(d)
+        by_path[os.path.realpath(d["path"])] = d
+        if d["path"] in files or os.path.realpath(d["path"]) in files:
+            if d.get("id"):
+                ids.add(d["id"])
+
+    for p in list_pi_processes():
+        sf = p.get("sessionFileFromEnv")
+        sid = p.get("sessionIdFromEnv")
+        if sid:
+            ids.add(sid)
+        if sf:
+            rp = os.path.realpath(sf)
+            files.add(rp)
+            if rp in by_path and by_path[rp].get("id"):
+                ids.add(by_path[rp]["id"])
+        cwd = p.get("cwd")
+        if cwd and len(by_cwd.get(cwd, [])) == 1:
+            only = by_cwd[cwd][0]
+            if only.get("id"):
+                ids.add(only["id"])
+
+    return ids
+
+
+def best_effort_live_map() -> list[dict[str, Any]]:
+    registry = {r.get("sessionId"): r for r in list_live_registry() if r.get("alive")}
+    disk = list_disk_sessions(enriched=False)
+    by_cwd: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    by_id = {d["id"]: d for d in disk if d.get("id")}
+    for d in disk:
+        if d.get("cwd"):
+            by_cwd[d["cwd"]].append(d)
+
+    procs = list_pi_processes()
+    window_sessions: dict[str, dict[str, str]] = {}
+    out = subprocess.check_output(["ps", "-eo", "pid=,comm="], text=True)
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        pid = int(parts[0])
+        env = read_proc_environ(pid)
+        wid = env.get("WINDOWID")
+        sf = env.get("PI_SESSION_FILE")
+        sid = env.get("PI_SESSION_ID")
+        if wid and (sf or sid):
+            window_sessions[wid] = {"sessionFile": sf or "", "sessionId": sid or ""}
+
+    titles = {t["windowId"]: t for t in list_terminal_titles()}
+    used_session_ids: set[str] = set()
+    rows_by_pid: dict[int, dict[str, Any]] = {}
+    reg_by_pid = {r.get("pid"): r for r in registry.values()}
+
+    def base_rec(p: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "pid": p["pid"],
+            "cwd": p["cwd"],
+            "windowId": p.get("windowId"),
+            "title": titles.get(str(p.get("windowId") or ""), {}).get("title"),
+            "source": None,
+            "sessionId": None,
+            "sessionFile": None,
+            "name": None,
+            "confidence": "none",
+        }
+
+    for p in procs:
+        rec = base_rec(p)
+        r = reg_by_pid.get(p["pid"])
+        if r:
+            rec.update(
+                {
+                    "sessionId": r.get("sessionId"),
+                    "sessionFile": r.get("sessionFile"),
+                    "name": r.get("name"),
+                    "cwd": r.get("cwd") or rec["cwd"],
+                    "title": r.get("title") or rec["title"],
+                    "source": "live-registry",
+                    "confidence": "high",
+                }
+            )
+        else:
+            ws = window_sessions.get(str(p.get("windowId") or ""))
+            if ws and (ws.get("sessionFile") or ws.get("sessionId")):
+                sid = ws.get("sessionId") or None
+                sf = ws.get("sessionFile") or None
+                if not sf and sid and sid in by_id:
+                    sf = by_id[sid]["path"]
+                name = by_id.get(sid or "", {}).get("name") if sid else None
+                rec.update(
+                    {
+                        "sessionId": sid,
+                        "sessionFile": sf,
+                        "name": name,
+                        "source": "child-env",
+                        "confidence": "high" if sf else "medium",
+                    }
+                )
+        if rec.get("sessionId"):
+            used_session_ids.add(rec["sessionId"])
+        rows_by_pid[p["pid"]] = rec
+
+    for p in procs:
+        rec = rows_by_pid[p["pid"]]
+        if rec.get("sessionId") or rec.get("sessionFile"):
+            continue
+        cands = by_cwd.get(p["cwd"] or "", [])
+        unused = [c for c in cands if c["id"] not in used_session_ids]
+        if len(cands) == 1:
+            c, conf = cands[0], "medium"
+        elif len(unused) == 1:
+            c, conf = unused[0], "medium"
+        elif unused:
+            c, conf = unused[0], "low"
+        elif cands:
+            c, conf = cands[0], "low"
+        else:
+            c, conf = None, "none"
+        if c:
+            rec.update(
+                {
+                    "sessionId": c["id"],
+                    "sessionFile": c["path"],
+                    "name": c.get("name"),
+                    "source": "cwd-heuristic",
+                    "confidence": conf,
+                    "ambiguous": conf == "low" and len(cands) > 1,
+                    "sessionsInCwd": len(cands),
+                }
+            )
+            used_session_ids.add(c["id"])
+        else:
+            rec["source"] = "process-only"
+            rec["confidence"] = "none"
+
+    rows = [rows_by_pid[p["pid"]] for p in procs]
+    seen_pids = {r["pid"] for r in rows}
+    for r in registry.values():
+        if r.get("pid") in seen_pids:
+            continue
+        rows.append(
+            {
+                "pid": r.get("pid"),
+                "cwd": r.get("cwd"),
+                "windowId": r.get("windowId"),
+                "title": r.get("title"),
+                "sessionId": r.get("sessionId"),
+                "sessionFile": r.get("sessionFile"),
+                "name": r.get("name"),
+                "source": "live-registry-orphan",
+                "confidence": "high",
+            }
+        )
+    return rows
+
+
+def print_table(rows: list[dict[str, Any]], kind: str) -> None:
+    if not rows:
+        print("(none)")
+        return
+    if kind == "disk":
+        print(f"{'MTIME':16} {'NAME':18} {'LAST USER MESSAGE':48} {'CWD':28} ID")
+        for r in rows:
+            print(
+                f"{human_time(r['mtime'])[:16]:16} "
+                f"{one_line(r.get('name') or '-', 18):18} "
+                f"{one_line(r.get('lastUser'), 48):48} "
+                f"{one_line(short_path(r.get('cwd')), 28):28} "
+                f"{(r.get('id') or '')[:8]}"
+            )
+    elif kind == "live":
+        print(f"{'CONF':6} {'PID':>7} {'NAME':18} {'CWD':36} {'TITLE':28} ID")
+        for r in rows:
+            print(
+                f"{(r.get('confidence') or '-'):6} {str(r.get('pid') or '-'):>7} "
+                f"{(r.get('name') or '-'):18.18} {short_path(r.get('cwd')):36.36} "
+                f"{(r.get('title') or '-').replace('Terminal - ', ''):28.28} "
+                f"{(r.get('sessionId') or '-')[:8]}"
+            )
+    else:
+        for r in rows:
+            print(json.dumps(r, ensure_ascii=False))
+
+
+def default_snapshot_path() -> pathlib.Path:
+    stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+    return DEFAULT_SNAPSHOT_DIR / f"snapshot-{stamp}.json"
+
+
+def cmd_snapshot(path: str | None) -> int:
+    dest = pathlib.Path(path) if path else default_snapshot_path()
+    live = best_effort_live_map()
+    disk = list_disk_sessions(enriched=False)
+    payload = {
+        "version": 1,
+        "createdAt": iso_now(),
+        "host": os.uname().nodename if hasattr(os, "uname") else None,
+        "live": live,
+        "diskSessions": [
+            {
+                "id": d["id"],
+                "cwd": d["cwd"],
+                "name": d.get("name"),
+                "path": d["path"],
+                "mtime": human_time(d["mtime"]),
+                "size": d["size"],
+            }
+            for d in disk
+        ],
+        "notes": {
+            "highConfidence": sum(1 for x in live if x.get("confidence") == "high"),
+            "mediumConfidence": sum(1 for x in live if x.get("confidence") == "medium"),
+            "lowConfidence": sum(1 for x in live if x.get("confidence") == "low"),
+        },
+    }
+    write_json(dest, payload)
+    write_json(DEFAULT_SNAPSHOT_DIR / "latest.json", payload)
+    print(f"Wrote {dest}")
+    print(
+        f"Live pi processes: {len(live)} "
+        f"(high={payload['notes']['highConfidence']} "
+        f"medium={payload['notes']['mediumConfidence']} "
+        f"low={payload['notes']['lowConfidence']})"
+    )
+    return 0
+
+
+def resolve_session(spec: str) -> dict[str, Any] | None:
+    p = pathlib.Path(spec).expanduser()
+    if p.exists() and p.is_file():
+        row = enrich_session(p)
+        return row
+    disk = list_disk_sessions(enriched=False)
+    exact = [d for d in disk if d.get("id") == spec]
+    if exact:
+        return enrich_session(pathlib.Path(exact[0]["path"]))
+    pref = [d for d in disk if (d.get("id") or "").startswith(spec)]
+    if len(pref) == 1:
+        return enrich_session(pathlib.Path(pref[0]["path"]))
+    if len(pref) > 1:
+        print(f"Ambiguous session id prefix {spec!r}:", file=sys.stderr)
+        for d in pref[:10]:
+            print(f"  {d['id']}  {short_path(d.get('cwd'))}  {d.get('name') or '-'}", file=sys.stderr)
+        return None
+    return None
+
+
+def resume_session(spec: str | dict[str, Any], exec_pi: bool = True) -> int:
+    row: dict[str, Any] | None
+    if isinstance(spec, dict):
+        row = spec
+    else:
+        row = resolve_session(spec)
+    if not row:
+        print(f"No session matched {spec!r}", file=sys.stderr)
+        return 1
+    cwd = row.get("cwd") or os.getcwd()
+    path = row["path"]
+    if not pathlib.Path(cwd).is_dir():
+        print(f"Session cwd does not exist: {cwd}", file=sys.stderr)
+        print(f"Session file: {path}", file=sys.stderr)
+        return 1
+    print(f"cwd:  {cwd}")
+    print(f"file: {path}")
+    print(f"id:   {row.get('id')}")
+    if row.get("name"):
+        print(f"name: {row['name']}")
+    if not exec_pi:
+        return 0
+    os.chdir(cwd)
+    os.execvp(PI_BIN, [PI_BIN, "--session", path])
+    return 1
+
+
+def open_in_terminal(row: dict[str, Any]) -> str | None:
+    cwd = row.get("cwd") or os.getcwd()
+    path = row.get("path") or row.get("sessionFile")
+    if not path or not pathlib.Path(path).exists():
+        return "missing session file"
+    if not pathlib.Path(cwd).is_dir():
+        return f"missing cwd: {cwd}"
+    term = shutil.which("xfce4-terminal")
+    title = row.get("name") or pathlib.Path(cwd).name
+    title = f"π - {title}"
+    inner = f"cd {shlex_quote(cwd)} && exec {shlex_quote(PI_BIN)} --session {shlex_quote(path)}"
+    if term:
+        cmd = [
+            term,
+            f"--working-directory={cwd}",
+            f"--title={title}",
+            f"--command=bash -lc {shlex_quote(inner)}",
+        ]
+        subprocess.Popen(cmd, start_new_session=True)
+        return None
+    # fallback: background shell
+    subprocess.Popen(["bash", "-lc", inner], start_new_session=True, cwd=cwd)
+    return None
+
+
+def cmd_restore(snapshot: str | None, dry_run: bool, assume_yes: bool, min_confidence: str) -> int:
+    path = pathlib.Path(snapshot or (DEFAULT_SNAPSHOT_DIR / "latest.json")).expanduser()
+    if not path.exists():
+        print(f"No snapshot at {path}. Run: pi-sessions snapshot", file=sys.stderr)
+        return 1
+    data = read_json(path)
+    live = data.get("live") or []
+    order = {"high": 3, "medium": 2, "low": 1, "none": 0}
+    min_c = order.get(min_confidence, 2)
+    targets = []
+    for r in live:
+        conf = r.get("confidence") or "none"
+        if order.get(conf, 0) < min_c:
+            continue
+        sf = r.get("sessionFile")
+        cwd = r.get("cwd")
+        if not sf or not cwd:
+            continue
+        if not pathlib.Path(sf).exists() or not pathlib.Path(cwd).is_dir():
+            continue
+        title = r.get("title") or r.get("name") or pathlib.Path(cwd).name
+        title = title.replace("Terminal - ", "")
+        if not title.startswith("π"):
+            title = f"π - {title}"
+        targets.append({"cwd": cwd, "sessionFile": sf, "title": title, "confidence": conf, "path": sf, "name": r.get("name")})
+
+    seen = set()
+    unique = []
+    for t in targets:
+        if t["sessionFile"] in seen:
+            continue
+        seen.add(t["sessionFile"])
+        unique.append(t)
+    targets = unique
+    if not targets:
+        print("No restorable targets")
+        return 1
+    print(f"Snapshot: {path}")
+    print(f"Will open {len(targets)} terminal(s):")
+    for t in targets:
+        print(f"  [{t['confidence']}] {t['title']}\n           cd {t['cwd']}\n           pi --session {t['sessionFile']}")
+    if dry_run:
+        return 0
+    if not assume_yes:
+        try:
+            ans = input("Open these in xfce4-terminal? [y/N] ").strip().lower()
+        except EOFError:
+            ans = "n"
+        if ans not in ("y", "yes"):
+            print("Cancelled")
+            return 1
+    for t in targets:
+        err = open_in_terminal(t)
+        if err:
+            print(f"skip: {err}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Curses picker
+# ---------------------------------------------------------------------------
+
+
+def _safe_addnstr(win: "curses._CursesWindow", y: int, x: int, text: str, max_n: int, attr: int = 0) -> None:
+    try:
+        h, w = win.getmaxyx()
+        if y < 0 or y >= h or x >= w:
+            return
+        n = max(0, min(max_n, w - x - 1))
+        if n <= 0:
+            return
+        if attr:
+            win.addnstr(y, x, text, n, attr)
+        else:
+            win.addnstr(y, x, text, n)
+    except curses.error:
+        pass
+
+
+def draw_nano_legend(
+    win: "curses._CursesWindow",
+    start_y: int,
+    width: int,
+    bindings: list[tuple[str, str]],
+    *,
+    key_attr: int,
+    label_attr: int,
+    cols: int = 4,
+) -> int:
+    """Draw nano-style key legend. Returns number of rows used.
+
+    Each binding is (key, label), e.g. ("^M", "Resume") or ("o", "New Term").
+    Keys are reverse-video; labels are plain — same pattern as nano's footer.
+    """
+    if width < 20 or not bindings:
+        return 0
+    cols = max(1, min(cols, len(bindings)))
+    # Leave a little slack so last cell does not wrap/crash on tiny terminals.
+    cell_w = max(12, (width - 1) // cols)
+    rows_needed = (len(bindings) + cols - 1) // cols
+    for row_i in range(rows_needed):
+        y = start_y + row_i
+        x = 0
+        for col_i in range(cols):
+            idx = row_i * cols + col_i
+            if idx >= len(bindings):
+                break
+            key, label = bindings[idx]
+            # Nano packs: KEY + space + label, padded to cell width.
+            key_s = f" {key} "
+            # remaining space in cell after key for label + padding
+            rest = cell_w - len(key_s)
+            if rest < 2:
+                lab_s = ""
+            else:
+                lab_s = f" {label}"
+                if len(lab_s) > rest:
+                    lab_s = lab_s[: rest - 1] + "…" if rest > 1 else lab_s[:rest]
+                lab_s = lab_s.ljust(rest)
+            _safe_addnstr(win, y, x, key_s, len(key_s), key_attr)
+            _safe_addnstr(win, y, x + len(key_s), lab_s, max(0, cell_w - len(key_s)), label_attr)
+            x += cell_w
+            if x >= width - 1:
+                break
+    return rows_needed
+
+
+def build_picker_rows(
+    *,
+    cwd_only: bool,
+    include_running: bool,
+    scope_cwd: str | None,
+) -> list[dict[str, Any]]:
+    rows = list_disk_sessions(enriched=True)
+    running = running_session_ids()
+    scope = os.path.realpath(scope_cwd) if scope_cwd else None
+    out = []
+    for r in rows:
+        if cwd_only and scope:
+            rcwd = r.get("cwd")
+            if not rcwd or os.path.realpath(rcwd) != scope:
+                continue
+        sid = r.get("id")
+        is_run = bool(sid and sid in running)
+        r = dict(r)
+        r["running"] = is_run
+        if not include_running and is_run:
+            continue
+        out.append(r)
+    return out
+
+
+def curses_picker(
+    *,
+    cwd_only: bool = True,
+    include_running: bool = False,
+    scope_cwd: str | None = None,
+) -> dict[str, Any] | None:
+    """Arrow-key table. Returns action dict or None if cancelled.
+
+    Return shapes:
+      {"action": "resume", "row": ...}
+      {"action": "quit"}
+    Opening in external terminal is handled inside the loop (multi-fire).
+    """
+    scope_cwd = scope_cwd or os.getcwd()
+    filter_text = ""
+    cursor = 0
+    scroll = 0
+    status = ""
+    opened = 0
+
+    def filtered(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not filter_text:
+            return rows
+        q = filter_text.lower()
+        out = []
+        for r in rows:
+            blob = " ".join(
+                [
+                    str(r.get("name") or ""),
+                    str(r.get("lastUser") or ""),
+                    str(r.get("cwd") or ""),
+                    str(r.get("id") or ""),
+                ]
+            ).lower()
+            if q in blob:
+                out.append(r)
+        return out
+
+    def load() -> list[dict[str, Any]]:
+        return build_picker_rows(cwd_only=cwd_only, include_running=include_running, scope_cwd=scope_cwd)
+
+    rows_all = load()
+
+    def run(stdscr: "curses._CursesWindow") -> dict[str, Any] | None:
+        nonlocal cursor, scroll, filter_text, status, opened, rows_all, cwd_only, include_running
+
+        curses.curs_set(0)
+        curses.use_default_colors()
+        if curses.has_colors():
+            curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN)  # selected row
+            curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_WHITE)  # title bar
+            curses.init_pair(3, curses.COLOR_CYAN, -1)  # column header
+            curses.init_pair(4, curses.COLOR_RED, -1)  # running
+            curses.init_pair(5, curses.COLOR_WHITE, -1)  # muted status
+            curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_CYAN)  # nano key chip
+            curses.init_pair(7, curses.COLOR_WHITE, curses.COLOR_BLUE)  # nano legend bg row
+
+        editing_filter = False
+
+        # Nano-style bindings: (key shown, label). Always visible at bottom.
+        main_bindings: list[tuple[str, str]] = [
+            ("^M", "Resume"),
+            ("o", "New Term"),
+            ("↑↓", "Move"),
+            ("/", "Filter"),
+            ("a", "All CWD"),
+            ("i", "Running"),
+            ("r", "Reload"),
+            ("q", "Quit"),
+        ]
+        filter_bindings: list[tuple[str, str]] = [
+            ("Enter", "Apply"),
+            ("Bksp", "Delete"),
+            ("Esc", "Cancel"),
+            ("type", "Search"),
+        ]
+
+        while True:
+            rows = filtered(rows_all)
+            if cursor >= len(rows):
+                cursor = max(0, len(rows) - 1)
+            if cursor < 0:
+                cursor = 0
+
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+
+            # Layout (nano-like): title · columns · body · status · legend
+            legend_cols = 4 if w >= 72 else (3 if w >= 54 else 2)
+            active_bindings = filter_bindings if editing_filter else main_bindings
+            legend_rows = max(1, (len(active_bindings) + legend_cols - 1) // legend_cols)
+            status_lines = 1
+            header_lines = 3  # title + column headers + rule
+            footer_lines = status_lines + legend_rows
+            body_h = max(1, h - header_lines - footer_lines)
+
+            scope_label = short_path(scope_cwd) if cwd_only else "ALL directories"
+            run_label = "include running" if include_running else "non-running"
+            title = f" pi-sessions  {scope_label}  [{run_label}]  {len(rows)}/{len(rows_all)} "
+            title_attr = curses.color_pair(2) | curses.A_BOLD if curses.has_colors() else curses.A_REVERSE
+            _safe_addnstr(stdscr, 0, 0, title.ljust(max(0, w - 1)), w - 1, title_attr)
+
+            col_num = 4
+            col_mtime = 16
+            col_name = max(12, min(22, w // 6))
+            col_id = 10
+            col_msg = max(10, w - (col_num + col_mtime + col_name + col_id + 6))
+
+            hdr = (
+                f"{'#':>{col_num-1}}  "
+                f"{'UPDATED':<{col_mtime}} "
+                f"{'NAME':<{col_name}} "
+                f"{'LAST THING YOU WROTE':<{col_msg}} "
+                f"{'ID':<{col_id}}"
+            )
+            col_attr = curses.color_pair(3) | curses.A_BOLD if curses.has_colors() else curses.A_BOLD
+            _safe_addnstr(stdscr, 1, 0, hdr, w - 1, col_attr)
+            _safe_addnstr(stdscr, 2, 0, "─" * max(0, w - 1), w - 1)
+
+            if not rows:
+                _safe_addnstr(
+                    stdscr,
+                    header_lines,
+                    2,
+                    "No sessions match this filter/scope.",
+                    w - 3,
+                    curses.A_DIM,
+                )
+            else:
+                if cursor < scroll:
+                    scroll = cursor
+                if cursor >= scroll + body_h:
+                    scroll = cursor - body_h + 1
+
+                for i in range(body_h):
+                    idx = scroll + i
+                    if idx >= len(rows):
+                        break
+                    r = rows[idx]
+                    y = header_lines + i
+                    name = r.get("name") or "—"
+                    msg = r.get("lastUser") or "—"
+                    line = (
+                        f"{idx+1:>{col_num-1}}  "
+                        f"{human_time(r.get('mtime'))[:col_mtime]:<{col_mtime}} "
+                        f"{one_line(name, col_name):<{col_name}} "
+                        f"{one_line(msg, col_msg):<{col_msg}} "
+                        f"{(r.get('id') or '')[:8]:<{col_id}}"
+                    )
+                    if idx == cursor:
+                        attr = curses.color_pair(1) | curses.A_BOLD if curses.has_colors() else curses.A_REVERSE
+                    elif r.get("running"):
+                        attr = curses.color_pair(4) if curses.has_colors() else curses.A_DIM
+                    else:
+                        attr = curses.A_NORMAL
+                    _safe_addnstr(stdscr, y, 0, line.ljust(max(0, w - 1)), w - 1, attr)
+
+            # Status line (above nano legend) — selection detail / filter / messages
+            status_y = h - footer_lines
+            if editing_filter:
+                status_txt = f" Filter: {filter_text}▌"
+            elif rows:
+                sel = rows[cursor]
+                last = one_line(sel.get("lastUser"), max(12, w - 36))
+                status_txt = (
+                    f" {short_path(sel.get('cwd'))}"
+                    f"  ·  {'RUNNING' if sel.get('running') else 'stopped'}"
+                    f"  ·  {(sel.get('size') or 0)//1024}k"
+                    f"  ·  {last}"
+                )
+                if status:
+                    status_txt += f"  ·  {status}"
+            else:
+                status_txt = f" {status}" if status else " (no rows)"
+            st_attr = curses.color_pair(5) if curses.has_colors() else curses.A_DIM
+            _safe_addnstr(stdscr, status_y, 0, status_txt.ljust(max(0, w - 1)), w - 1, st_attr)
+
+            # Nano-style key legend at the very bottom
+            legend_y = status_y + 1
+            # Paint legend background rows like nano's help bar
+            legend_bg = curses.color_pair(7) if curses.has_colors() else curses.A_REVERSE
+            for ly in range(legend_rows):
+                _safe_addnstr(stdscr, legend_y + ly, 0, " " * max(0, w - 1), w - 1, legend_bg)
+            key_attr = curses.color_pair(6) | curses.A_BOLD if curses.has_colors() else curses.A_REVERSE | curses.A_BOLD
+            label_attr = legend_bg
+            draw_nano_legend(
+                stdscr,
+                legend_y,
+                w,
+                active_bindings,
+                key_attr=key_attr,
+                label_attr=label_attr,
+                cols=legend_cols,
+            )
+
+            stdscr.refresh()
+            ch = stdscr.getch()
+
+            if editing_filter:
+                if ch in (27,):
+                    editing_filter = False
+                elif ch in (curses.KEY_ENTER, 10, 13):
+                    editing_filter = False
+                elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                    filter_text = filter_text[:-1]
+                    cursor = 0
+                    scroll = 0
+                elif 32 <= ch <= 126:
+                    filter_text += chr(ch)
+                    cursor = 0
+                    scroll = 0
+                continue
+
+            if ch in (ord("q"), 27):
+                return {"action": "quit"}
+            if ch in (curses.KEY_UP, ord("k")):
+                cursor = max(0, cursor - 1)
+            elif ch in (curses.KEY_DOWN, ord("j")):
+                cursor = min(max(0, len(rows) - 1), cursor + 1)
+            elif ch == curses.KEY_NPAGE:
+                cursor = min(max(0, len(rows) - 1), cursor + body_h)
+            elif ch == curses.KEY_PPAGE:
+                cursor = max(0, cursor - body_h)
+            elif ch == curses.KEY_HOME:
+                cursor = 0
+            elif ch == curses.KEY_END:
+                cursor = max(0, len(rows) - 1)
+            elif ch == ord("/"):
+                editing_filter = True
+            elif ch == ord("a"):
+                cwd_only = not cwd_only
+                rows_all = load()
+                cursor = 0
+                scroll = 0
+                status = "cwd only" if cwd_only else "all directories"
+            elif ch == ord("i"):
+                include_running = not include_running
+                rows_all = load()
+                cursor = 0
+                scroll = 0
+                status = "include running" if include_running else "non-running only"
+            elif ch == ord("r"):
+                rows_all = load()
+                status = f"reloaded {len(rows_all)} · opened {opened}"
+            elif ch == ord("o"):
+                if not rows:
+                    status = "nothing selected"
+                    continue
+                sel = rows[cursor]
+                # leave curses briefly? Popen is fine
+                err = open_in_terminal(sel)
+                if err:
+                    status = err
+                else:
+                    opened += 1
+                    status = f"opened terminal #{opened}: {(sel.get('name') or sel.get('id') or '')[:40]}"
+                    # mark running locally so it drops from non-running list on next filter
+                    if not include_running:
+                        # reload after short delay would be better; optimistically hide
+                        sid = sel.get("id")
+                        rows_all = [x for x in rows_all if x.get("id") != sid]
+                        if cursor >= len(filtered(rows_all)):
+                            cursor = max(0, len(filtered(rows_all)) - 1)
+            elif ch in (curses.KEY_ENTER, 10, 13):
+                if not rows:
+                    status = "nothing selected"
+                    continue
+                return {"action": "resume", "row": rows[cursor]}
+            elif ch == ord("?"):
+                status = "see bottom legend (nano-style)"
+
+        return {"action": "quit"}
+
+    return curses.wrapper(run)
+
+
+def cmd_pick_tui(
+    *,
+    cwd_only: bool = True,
+    include_running: bool = False,
+    scope_cwd: str | None = None,
+) -> int:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        # fallback plain list
+        rows = build_picker_rows(cwd_only=cwd_only, include_running=include_running, scope_cwd=scope_cwd or os.getcwd())
+        print_table(rows, "disk")
+        return 0 if rows else 1
+
+    result = curses_picker(cwd_only=cwd_only, include_running=include_running, scope_cwd=scope_cwd)
+    if not result or result.get("action") == "quit":
+        return 0
+    if result.get("action") == "resume":
+        row = result["row"]
+        # end curses first (wrapper already ended)
+        return resume_session(row["path"], exec_pi=True)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    # Default command: interactive non-running picker for current cwd
+    if not argv:
+        return cmd_pick_tui(cwd_only=True, include_running=False)
+
+    parser = argparse.ArgumentParser(
+        description="Pi session picker/restore with cwd",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  pi-sessions                 # arrow table: non-running sessions in $PWD
+  pi-sessions pick --all-cwd  # every project
+  pi-sessions pick -i         # include already-running
+  pi-sessions resume 01a1b8ab
+  pi-sessions snapshot && pi-sessions restore --dry-run
+""",
+    )
+    sub = parser.add_subparsers(dest="cmd")
+
+    p_list = sub.add_parser("list", help="List saved sessions on disk (text table)")
+    p_list.add_argument("--all", action="store_true")
+    p_list.add_argument("--named", action="store_true")
+    p_list.add_argument("--days", type=float, default=30)
+    p_list.add_argument("--cwd", action="store_true", help="Only current directory")
+
+    sub.add_parser("live", help="Show currently running pi sessions (best effort)")
+
+    p_snap = sub.add_parser("snapshot", help="Snapshot live sessions for post-reboot restore")
+    p_snap.add_argument("file", nargs="?", help="Output path")
+
+    p_pick = sub.add_parser("pick", help="Arrow-key table picker (default)")
+    p_pick.add_argument("--all-cwd", action="store_true", help="Show sessions from every directory")
+    p_pick.add_argument("-i", "--include-running", action="store_true", help="Include sessions already running")
+    p_pick.add_argument("--cwd", default=None, help="Scope directory (default: $PWD)")
+    # legacy flags ignored/mapped
+    p_pick.add_argument("--all", action="store_true", help=argparse.SUPPRESS)
+    p_pick.add_argument("--live", action="store_true", help=argparse.SUPPRESS)
+    p_pick.add_argument("--snapshot", nargs="?", const=str(DEFAULT_SNAPSHOT_DIR / "latest.json"), help=argparse.SUPPRESS)
+
+    p_res = sub.add_parser("resume", help="cd to session cwd and exec pi --session")
+    p_res.add_argument("spec", help="Session file path or id/prefix")
+    p_res.add_argument("--print", action="store_true", help="Print targets only, do not exec")
+
+    p_rest = sub.add_parser("restore", help="Re-open snapshot sessions in new terminals")
+    p_rest.add_argument("--snapshot", help="Snapshot file (default: latest)")
+    p_rest.add_argument("--dry-run", action="store_true")
+    p_rest.add_argument("--yes", action="store_true")
+    p_rest.add_argument("--min-confidence", choices=["high", "medium", "low"], default="medium")
+
+    args = parser.parse_args(argv)
+
+    if args.cmd is None:
+        return cmd_pick_tui(cwd_only=True, include_running=False)
+
+    if args.cmd == "list":
+        rows = list_disk_sessions(enriched=True)
+        if args.named:
+            rows = [r for r in rows if r.get("name")]
+        if args.cwd:
+            here = os.path.realpath(os.getcwd())
+            rows = [r for r in rows if r.get("cwd") and os.path.realpath(r["cwd"]) == here]
+        if not args.all:
+            cutoff = time.time() - args.days * 86400
+            rows = [r for r in rows if r["mtime"] >= cutoff]
+        print_table(rows, "disk")
+        return 0
+    if args.cmd == "live":
+        print_table(best_effort_live_map(), "live")
+        return 0
+    if args.cmd == "snapshot":
+        return cmd_snapshot(args.file)
+    if args.cmd == "pick":
+        cwd_only = not (args.all_cwd or args.all)
+        return cmd_pick_tui(
+            cwd_only=cwd_only,
+            include_running=bool(args.include_running),
+            scope_cwd=args.cwd or os.getcwd(),
+        )
+    if args.cmd == "resume":
+        return resume_session(args.spec, exec_pi=not args.print)
+    if args.cmd == "restore":
+        return cmd_restore(args.snapshot, args.dry_run, args.yes, args.min_confidence)
+    parser.error(f"unknown command {args.cmd}")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
