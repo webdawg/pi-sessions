@@ -5,9 +5,9 @@
 
 Primary UX
 ----------
-  pi-sessions              # arrow-key table of non-running sessions (cwd-scoped)
+  pi-sessions              # arrow-key table of non-running sessions (all projects)
   pi-sessions pick         # same
-  pi-sessions pick --all-cwd
+  pi-sessions pick --cwd /path/to/project  # restrict to one project
 
 Table columns: name, last user message, cwd, mtime, id.
 Keys: ↑↓ move · Enter resume here · o open new terminal (stay) · / filter · q quit
@@ -124,12 +124,19 @@ def enrich_session(path: pathlib.Path) -> dict[str, Any] | None:
     last_user_ts = None
     try:
         size = st.st_size
+        # Session names are stored in session_info records, usually near the
+        # beginning, while the latest user message is near the end. Read both
+        # ends so names remain discoverable even for large sessions.
         with path.open("rb") as fh:
             if size > TAIL_SCAN_BYTES:
-                fh.seek(size - TAIL_SCAN_BYTES)
+                head = fh.read(TAIL_SCAN_BYTES)
+                fh.seek(max(0, size - TAIL_SCAN_BYTES))
                 fh.readline()
-            data = fh.read().decode("utf-8", "replace")
-        for line in data.splitlines():
+                tail = fh.read()
+                data = head + b"\n" + tail
+            else:
+                data = fh.read()
+        for line in data.decode("utf-8", "replace").splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -1098,16 +1105,17 @@ def cmd_pick_tui(
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
 
-    # Default command: interactive non-running picker for current cwd
+    # Default command: interactive non-running picker across all saved projects.
+    # A session can be resumed from anywhere; use --cwd to narrow the view.
     if not argv:
-        return cmd_pick_tui(cwd_only=True, include_running=False)
+        return cmd_pick_tui(cwd_only=False, include_running=False)
 
     parser = argparse.ArgumentParser(
         description="Pi session picker/restore with cwd",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""examples:
-  pi-sessions                 # arrow table: non-running sessions in $PWD
-  pi-sessions pick --all-cwd  # every project
+  pi-sessions                 # arrow table: non-running sessions across all projects
+  pi-sessions pick --cwd DIR  # restrict to one project
   pi-sessions pick -i         # include already-running
   pi-sessions resume 01a1b8ab
   pi-sessions snapshot && pi-sessions restore --dry-run
@@ -1127,9 +1135,9 @@ def main(argv: list[str] | None = None) -> int:
     p_snap.add_argument("file", nargs="?", help="Output path")
 
     p_pick = sub.add_parser("pick", help="Arrow-key table picker (default)")
-    p_pick.add_argument("--all-cwd", action="store_true", help="Show sessions from every directory")
+    p_pick.add_argument("--all-cwd", action="store_true", help="Compatibility option; all directories are the default")
     p_pick.add_argument("-i", "--include-running", action="store_true", help="Include sessions already running")
-    p_pick.add_argument("--cwd", default=None, help="Scope directory (default: $PWD)")
+    p_pick.add_argument("--cwd", default=None, help="Scope to this directory (default: all saved projects)")
     # legacy flags ignored/mapped
     p_pick.add_argument("--all", action="store_true", help=argparse.SUPPRESS)
     p_pick.add_argument("--live", action="store_true", help=argparse.SUPPRESS)
@@ -1148,7 +1156,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.cmd is None:
-        return cmd_pick_tui(cwd_only=True, include_running=False)
+        return cmd_pick_tui(cwd_only=False, include_running=False)
 
     if args.cmd == "list":
         rows = list_disk_sessions(enriched=True)
@@ -1168,7 +1176,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "snapshot":
         return cmd_snapshot(args.file)
     if args.cmd == "pick":
-        cwd_only = not (args.all_cwd or args.all)
+        # Global is the useful default: saved sessions are resumable from any
+        # directory. --cwd remains the opt-in narrow view; --all-cwd/--all are
+        # retained as compatibility no-ops for existing callers.
+        cwd_only = bool(args.cwd)
         return cmd_pick_tui(
             cwd_only=cwd_only,
             include_running=bool(args.include_running),

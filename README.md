@@ -9,6 +9,7 @@ Pi already stores each session’s working directory and can resume with
 `pi --resume`. This project adds:
 
 - a **nano-style** interactive table of sessions (name, last user message, id)
+  from every saved project, regardless of where the picker is started
 - **cwd-aware resume** (`cd` then `pi --session …`)
 - **rapid multi-start** (open selected sessions in new terminals while staying in the picker)
 - pre-reboot **snapshot / restore** of live Pi terminals
@@ -36,8 +37,8 @@ new ones) so the extension loads.
 
 ```sh
 cd /path/to/project
-pi-sessions                 # non-running sessions for $PWD
-pi-sessions pick --all-cwd  # every project
+pi-sessions                 # non-running sessions from every project
+pi-sessions pick --cwd /path/to/project  # restrict to one project
 pi-sessions pick -i         # include already-running
 ```
 
