@@ -77,6 +77,31 @@ Inside Pi, name important sessions so the NAME column stays readable:
 /name medical
 ```
 
+### External agent sessions
+
+`pi-sessions` can also show launcher entries for sessions owned by another
+agent, such as Claude Code. These are launchers, not converted Pi transcripts;
+the other agent's own session store remains authoritative.
+
+Create `~/.config/pi-sessions/external-sessions.json` as a JSON list:
+
+```json
+[
+  {
+    "id": "external:ansible_vm_build_original_backup",
+    "name": "ansible_vm_build_original_backup",
+    "description": "Claude Code session",
+    "cwd": "/home/neoweb/DATA/CODE/X-INFRASTRUCTURE",
+    "command": ["claude", "--resume", "ansible_vm_build_original_backup"]
+  }
+]
+```
+
+The entry appears in the picker. Enter resumes it in the current terminal; `o`
+opens it in a new terminal. Use `pi-sessions resume <id> --print` to verify the
+resolved command without launching it. Do not copy Claude JSONL into Pi's
+`~/.pi/agent/sessions/` directory: the formats are different.
+
 ## Layout
 
 ```text
